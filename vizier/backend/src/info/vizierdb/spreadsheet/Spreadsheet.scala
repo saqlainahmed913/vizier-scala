@@ -96,6 +96,13 @@ class Spreadsheet(data: SpreadsheetDataSource)
           }
           .toArray
   }
+  def getFutureRow(row: Long): Array[Future[Any]] =
+  {
+    schema.map { col => 
+            overlay.getFuture(SingleCell(col.ref, row))
+          }
+          .toArray
+  }
   def getCell(column: Int, row: Long): Option[Try[Any]] =
   {
     overlay.getFuture(SingleCell(schema(column).ref, row)).value
@@ -245,23 +252,27 @@ class Spreadsheet(data: SpreadsheetDataSource)
    *                   the name of the column to insert to the left of.
    * @param  dataType  (optional) the data type of the new column
    */
-  def insertColumn(name: String, before: Option[String], dataType: DataType = StringType): Unit =
+  def insertColumn(name: String, before: Option[String], dataType: DataType = StringType): ColumnRef =
   {
     def newCol(position: Int) = 
       OutputColumn.withDefaultValue(StructField(name, dataType), null, getColumnId(), position)
-    val idx = before match {
+    val (idx, col) = before match {
       case None => {
-        schema.append(newCol(schema.size))
-        schema.size - 1
+        val col = newCol(schema.size)
+        schema.append(col)
+        (schema.size - 1, col)
       }
       case Some(name) => {
         val idx = indexOfColumn(name)
-        schema.insert(idx, newCol(idx))
+        val col = newCol(idx)
+        schema.insert(idx, col)
         for(i <- idx+1 until schema.size){ schema(i).position = i }
-        idx
+        (idx, col)
       }
     }
+    overlay.addColumn(col.ref)
     callback(_.refreshEverything())
+    col.ref
   }
 
   /**
@@ -271,8 +282,9 @@ class Spreadsheet(data: SpreadsheetDataSource)
   def deleteColumn(name: String): Unit = 
   {
     val idx = indexOfColumn(name)
-    columns.remove(schema.remove(idx).id)
+    val col = columns.remove(schema.remove(idx).id)
     for(i <- idx until schema.size) { schema(i).position = i }
+    if(col.isDefined) { overlay.deleteColumn(col.get.ref) }
 
     callback(_.refreshEverything())
   }
@@ -290,7 +302,7 @@ class Spreadsheet(data: SpreadsheetDataSource)
 
 object Spreadsheet
 {
-  def apply(base: DataFrame)(implicit ec: ExecutionContext) = 
+  def cachedSourceFromDataframe(base: DataFrame)(implicit ec: ExecutionContext): CachedSource =
   {
     val annotated = 
       AnnotateWithSequenceNumber(base)
@@ -318,15 +330,18 @@ object Spreadsheet
         selectForInvalidation = { (candidates, pageSize) => candidates.head }
       )
 
-    val spreadsheet =
-      new Spreadsheet(
-        new CachedSource(
-          base.schema.fields,
-          cache,
-          Future { df.count() }
-        )
-      )
-    cache.selectForInvalidation = spreadsheet.pickCachePageToDiscard _
+    return  new CachedSource(
+              base.schema.fields,
+              cache,
+              Future { df.count() }
+            )
+  }
+
+  def apply(base: DataFrame)(implicit ec: ExecutionContext) = 
+  {
+    val source = cachedSourceFromDataframe(base)
+    val spreadsheet = new Spreadsheet(source)
+    source.rows.selectForInvalidation = spreadsheet.pickCachePageToDiscard _
 
     /* return */ spreadsheet
   }

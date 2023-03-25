@@ -15,6 +15,7 @@ import scala.concurrent.Await
 import scala.concurrent.duration.Duration
 import com.typesafe.scalalogging.LazyLogging
 import scala.concurrent.duration._
+import scala.util.Try
 
 /**
  * This class acts as a sort of 
@@ -58,7 +59,7 @@ class UpdateOverlay(
   def cellNeeded(cell: SingleCell): Boolean =
     cellNeeded(cell.column, cell.row)
   def cellNeeded(column: ColumnRef, row: RowIndex): Boolean =
-    (subscriptions(row)) || (!triggers(column)(row).isEmpty)
+    (subscriptions(row)) || (!triggers(column).get(row).map { _.isEmpty }.getOrElse { true })
 
   def requiredSourceRows: RangeSet =
   {
@@ -104,18 +105,27 @@ class UpdateOverlay(
 
     // Since we're inserting a range of updates, figure out which of these
     // could potentially require re-execution
-    val requiredTriggers = 
+    val updateRowsThatNeedToBeMaterialized = 
       (activeTriggers(target.column) ++ subscriptions) intersect target.toRangeSet
 
-    logger.debug(s"Update requires triggers on rows $requiredTriggers")
+    logger.debug(s"Update requires materialization on rows $updateRowsThatNeedToBeMaterialized")
 
-    for(row <- requiredTriggers.indices)
-    {
-      addTriggerFor(target.column, row, rule)
-    }
+    val upstreamDependenciesThatNeedToBeMaterialized =
+      (
+        for(row <- updateRowsThatNeedToBeMaterialized.indices) yield
+        {
+          logger.trace(s"Adding trigger for ${target.column}:$row")
+          addTriggerFor(target.column, row, rule)
+        }
+      ).flatten.toSet
+
+    logger.debug(s"Update forces new dependencies on rows $upstreamDependenciesThatNeedToBeMaterialized")
 
     triggerReexecution(
-      requiredTriggers.indices.map { SingleCell(target.column, _) }.toSeq
+      updateRowsThatNeedToBeMaterialized.indices.map { 
+        SingleCell(target.column, _) 
+      }.toSeq ++ 
+      upstreamDependenciesThatNeedToBeMaterialized.toSeq
     )
   }
 
@@ -146,7 +156,7 @@ class UpdateOverlay(
     }
   }
 
-  def addTriggerFor(column: ColumnRef, row: RowIndex, rule: UpdateRule): Unit =
+  def addTriggerFor(column: ColumnRef, row: RowIndex, rule: UpdateRule): Seq[SingleCell] =
   {
     // triggers get added under two circumstances:
     // 1. We have a subscription for the specified row
@@ -155,22 +165,35 @@ class UpdateOverlay(
 
     // Breadth-first search this business
     val queue = mutable.Queue[(ColumnRef, RowIndex)]( column -> row )
+    val upstreamRequirements = mutable.ArrayBuffer[SingleCell]()
 
     while( !queue.isEmpty )
     {
       val (column, row) = queue.dequeue()
-      if(cellNeeded(column, row)){
-        for(cell <- rule.triggeringCells(row, frame)){
-          if(triggers(cell.column) contains cell.row){
-            triggers(cell.column)(cell.row).add(SingleCell(column, row), frame)
-          } else {
-            triggers(cell.column)(cell.row) = new TriggerSet(SingleCell(column, row), frame)
 
+      logger.trace(s"Tracing through upstream via $column:$row")
+
+      if(cellNeeded(column, row)){
+        logger.trace("... Cell is needed")
+        val currentRule = dag(column)(row)
+        if(currentRule.isDefined){
+          logger.trace("... Rule exists for cell")
+          val target = SingleCell(column, row)
+          for(cell <- currentRule.get.triggeringCells(row, frame)){
+            logger.trace(s"... Registering for triggers from $cell")
+            if(triggers(cell.column) contains cell.row){
+              triggers(cell.column)(cell.row).add(target, frame)
+            } else {
+              triggers(cell.column)(cell.row) = new TriggerSet(target, frame)
+            }
             // If this is the first reference to this cell, we may need to
             // recursively add it to the list of active dependencies
             dag(cell.column)(cell.row) match {
-              case None => ()
-              case Some(rule) => 
+              case None => 
+                // no re-evaluation needed... this is a reference to source data
+              case Some(_) => 
+                logger.trace("... Re-evalution needed")
+                upstreamRequirements += cell
                 queue.enqueue( cell.column -> cell.row )
             }
           }
@@ -178,11 +201,13 @@ class UpdateOverlay(
       }
 
     }
+
+    return upstreamRequirements.toSeq
   }
 
   def triggerReexecution(targets: Seq[SingleCell]): Unit = 
   {
-    logger.debug(s"Starting re-execution pass with targets: $targets")
+    logger.debug(s"Starting re-execution pass with targets: ${targets.groupBy { _.column }.mapValues { _.map { _.row }.toSet.toSeq.sorted.mkString(", ") }.mkString("; ")}")
 
     def collectUpstream(initial: Set[SingleCell], cell: SingleCell): Set[SingleCell] = 
     {
@@ -193,6 +218,7 @@ class UpdateOverlay(
       while( !queue.isEmpty )
       {
         val cell = queue.dequeue()
+        logger.trace(s"Exploring upstream via $cell")
   
         if(accum contains cell){ /* do nothing */ }
         else {
@@ -218,6 +244,7 @@ class UpdateOverlay(
       while( !queue.isEmpty )
       {
         val cell = queue.dequeue()
+        logger.trace(s"Exploring downstream via $cell")
 
         if(accum contains cell){ /* do nothing */ }
         else {
@@ -244,7 +271,7 @@ class UpdateOverlay(
          .map { cell => cell -> Promise[Any]() }
          .toMap
 
-    logger.debug(s"Final invalidated cells = ${cellPromises.keys.mkString(", ")}")
+    logger.debug(s"Final invalidated cells = ${cellPromises.keys.groupBy { _.column }.mapValues { _.map { _.row }.toSet.toSeq.sorted.mkString(", ") }.mkString("; ")}")
 
     for( (cell, promise) <- cellPromises )
     {
@@ -252,56 +279,99 @@ class UpdateOverlay(
       cellModified(cell.column, cell.row)
     }
 
-    Future {
-      logger.debug(s"Starting evaluation pass for ${cellPromises.keys.mkString(", ")}")
+    if(cellPromises.size > 0){
+      Future {
+        logger.debug(s"Starting evaluation pass for ${cellPromises.keys.mkString(", ")}")
 
-      def compute(cell: SingleCell, promise: Promise[Any], blockedCells: Set[SingleCell] = Set.empty): Unit =
-      {
-        logger.debug(s"Compute $cell (completed = ${promise.isCompleted})")
-        if(promise.isCompleted) { return }
-        val rule = dag(cell.column)(cell.row).get
-        try {
-          for(dependency <- rule.triggeringCells(cell.row, frame)){
-            logger.trace(s"Following up on dependency $dependency for $cell")
-            assert(!blockedCells(dependency), "Recursive dependency")
+        val todo = mutable.Stack[ (SingleCell, Seq[SingleCell]) ]()
 
-            cellPromises.get(dependency) match {
-              case None => () // dependency didn't need recomputation
-              case Some(depPromise) => 
-                // compute dependency first
-                if(!promise.isCompleted){ compute(dependency, depPromise, blockedCells + cell) }
+        def getDeps(cell: SingleCell): Seq[SingleCell] =
+        {
+          val rule = dag(cell.column)(cell.row).get
+          rule.triggeringCells(cell.row, frame)
+        }
+
+        for((rootCell, rootPromise) <- cellPromises)
+        {
+          if(!rootPromise.isCompleted)
+          {
+            todo.push( rootCell -> getDeps(rootCell) )
+            while(!todo.isEmpty)
+            {
+              val (cell, deps) = todo.pop()
+
+              if(!cellPromises(cell).isCompleted)
+              {
+                // try to evaluate the cell
+                try {
+                  // find the first uncompleted dependency
+                  deps.find { dep => !cellPromises.get(dep).map { _.isCompleted }.getOrElse { true } } match {
+                    case Some(dep) => // if there is an incomplete dependency
+                      logger.trace(s"Following up on dependency $dep for $cell")
+                      // check for cycles:
+                      assert(!todo.exists { _._1 == dep }, "Cyclic dependency in formula")
+                      // schedule the current cell for another attempt after the 
+                      // dependency is evaluated
+                      todo.push(cell -> deps)
+                      // schedule the first dependency for execution
+                      todo.push(dep -> getDeps(dep))
+                      // We only schedule one dependency at a time to ensure a DFS-style 
+                      // traversal.  Otherwise, cycle detection becomes substantially 
+                      // harder.
+
+                    case None => // if they're all done, evaluate the cell
+                      val rule = dag(cell.column)(cell.row).get
+                      logger.debug(s"All dependencies computed, starting evaluation of $cell\n${rule.expression}")
+                      cellPromises(cell).success(eval(cell.row, rule, 
+                        (cell, targetFrame) => {
+                          val future: Future[Any] =
+                            cellPromises.get(
+                              cell.copy(
+                                row =
+                                  targetFrame.relativeTo(frame)
+                                             .forward(cell.row)
+                                             .getOrElse {
+                                                assert(false, s"The cell ${cell}'s row was deleted"); 0
+                                             }
+                              )
+                            ).map { _.future }
+                             .getOrElse { getFuture(cell, targetFrame, allowUnsubscribed = true) }
+                          assert(future.isCompleted, s"Depending on incomplete cell: $cell")
+                          future
+                        }
+                      ))
+                      logger.trace("Evaluation pass complete")
+                      cellModified(cell.column, cell.row)
+                  }
+                } catch {
+                  case e: Throwable => 
+                    logger.error(s"Error while processing $cell: ${e.getMessage()}")
+                    e.printStackTrace()
+                    cellPromises(cell).failure(e)
+                    cellModified(cell.column, cell.row)
+                }
+              }
             }
           }
-          logger.debug(s"All dependencies computed, starting evaluation of $cell\n${rule.expression}")
-          promise.success(eval(cell.row, rule))
-          logger.trace("Evaluation pass complete")
-          cellModified(cell.column, cell.row)
-        } catch {
-          case e: Throwable => 
-            logger.error(s"Error while processing $cell: ${e.getMessage()}")
-            e.printStackTrace()
-            cellPromises(cell).failure(e)
         }
+      }.onComplete { 
+        case Success(_) => logger.debug("Finished processing cells")
+        case Failure(err) => println(s"Error: $err")
       }
-
-      cellPromises.foreach { case (cell, promise) => compute(cell, promise) }
-    }.onComplete { 
-      case Success(_) => logger.debug("Finished processing cells")
-      case Failure(err) => println(s"Error: $err")
     }
 
   }
 
-  def getFuture(cell: SingleCell, targetFrame: ReferenceFrame = frame): Future[Any] =
+  def getFuture(cell: SingleCell, targetFrame: ReferenceFrame = frame, allowUnsubscribed: Boolean = false): Future[Any] =
   {
-    assert(subscriptions(cell.row), "Reading from unsubscribed cell")
+    assert(allowUnsubscribed || subscriptions(cell.row), s"Reading from unsubscribed cell $cell")
     logger.trace(s"Read from $cell")
-    assert(data contains cell.column, "The cell ${cell}'s column was deleted")
+    assert(data contains cell.column, s"The cell ${cell}'s column was deleted")
     val rowInCurrentFrame = 
       targetFrame.relativeTo(frame)
                  .forward(RowByIndex(cell.row))
                  .getOrElse {
-                    assert(false, "The cell ${cell}'s row was deleted")
+                    assert(false, s"The cell ${cell}'s row was deleted")
                  }.asInstanceOf[RowByIndex].idx
 
     // logger.trace(dag(cell.column).toString())
@@ -320,9 +390,9 @@ class UpdateOverlay(
     }
   }
 
-  def get(cell: SingleCell, targetFrame: ReferenceFrame = frame): Any =
+  def get(cell: SingleCell, targetFrame: ReferenceFrame = frame, allowUnsubscribed: Boolean = false): Any =
   {
-    getFuture(cell, targetFrame).value match {
+    getFuture(cell, targetFrame, allowUnsubscribed).value match {
               case None => assert(false, s"Trying to read pending cell $cell")
               case Some(Success(result)) => result
               case Some(Failure(err)) => 
@@ -359,17 +429,31 @@ class UpdateOverlay(
     Await.result(getFuture(cell, targetFrame), duration)
   }
 
-  def eval(targetRow: RowIndex, rule: UpdateRule): Any =
+  def eval(targetRow: RowIndex, rule: UpdateRule, lookup: (SingleCell, ReferenceFrame) => Future[Any] = (c, f) => getFuture(c, f)): Any =
   {
     val offset = frame.relativeTo(rule.frame)
+    def getValue(cell: SingleCell): Expression =
+    {
+      lit(
+        lookup(cell, rule.frame).value
+          .getOrElse {
+            Failure(
+              new AssertionError(
+                s"Internal error: Computation depends on $cell, who's value has not been computed"
+              )
+            )
+          }
+          .get
+      ).expr
+    }
     val expr = 
       rule.expression.transform { 
         case RValueExpression(cell:SingleCell) => 
           logger.trace(s"Fetch $cell")
-          lit(get(cell, rule.frame)).expr
+          getValue(cell)
         case RValueExpression(cell:OffsetCell) =>
           logger.trace(s"Fetch [${cell.column}:${cell.rowOffset}] @ $targetRow")
-          lit(get(SingleCell(
+          getValue(SingleCell(
             cell.column,
             offset.forward(
               offset.backward( RowByIndex(targetRow) )
@@ -378,7 +462,7 @@ class UpdateOverlay(
             ).getOrElse {
               throw new AssertionError(s"Reading from deleted cell $cell")
             }
-          ), rule.frame)).expr
+          ))
       }
     logger.trace(s"Eval {$expr} @ $targetRow")
     return expr.eval(null)
@@ -414,6 +498,7 @@ class UpdateOverlay(
     val needsExecution = mutable.ArrayBuffer(forceCells.toSeq:_*)
     for( (column, lvalues) <- dag )
     {
+      logger.trace(s"Subscribe: exploring DAG for $column")
       for( (searchFrom, searchTo) <- rows )
       {
         for( (from, to, rule) <- lvalues(searchFrom, searchTo) )

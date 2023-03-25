@@ -226,7 +226,7 @@ class RowCache[T](
       def localIdx = (idx - start).toInt
       assert(localIdx >= 0)
       assert(localIdx < BUFFER_PAGE)
-      println(s"Fetch: $idx -> $localIdx (partial = $partial; size = ${data.map { _.size.toString }.getOrElse { "unloaded" }})")
+      // println(s"Fetch: $idx -> $localIdx (partial = $partial; size = ${data.map { _.size.toString }.getOrElse { "unloaded" }})")
       if(data.isEmpty || (partial && data.get.size <= localIdx)){ 
         // If this is a partial or data hasn't been loaded, trigger a full load
         tryToLoadData()
