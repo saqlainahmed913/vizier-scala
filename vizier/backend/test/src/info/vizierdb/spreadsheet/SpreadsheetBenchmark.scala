@@ -56,7 +56,7 @@ class SpreadsheetBenchmark
 
   def beforeAll(): Unit = {
     SharedTestResources.init()
-    data = lineitem().limit(6000)
+    data = lineitem()
     source = Spreadsheet.cachedSourceFromDataframe(data)
   }
 
@@ -90,7 +90,7 @@ class SpreadsheetBenchmark
 
   "Warm up the cache" >>
   {
-    for(i <- 0 until 6000)
+    for(i <- 0 until 10000)
     {
       source.rows(i)
     }
