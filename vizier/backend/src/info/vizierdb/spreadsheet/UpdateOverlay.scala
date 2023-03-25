@@ -127,10 +127,21 @@ class UpdateOverlay(
    */
   def delTriggerFor(column: ColumnRef, row: RowIndex, rule: UpdateRule): Unit =
   {
-    for(cell <- rule.triggeringCells(row, frame)){
-      triggers(cell.column)(cell.row).remove(SingleCell(column, row), frame)
-      if(!cellNeeded(cell)){
-        delTriggerFor(cell.column, cell.row, dag(cell.column)(cell.row).get)
+    val queue = mutable.Queue[(ColumnRef, RowIndex, UpdateRule)]( (column, row, rule) )
+
+    while( !queue.isEmpty )
+    {
+      val (column, row, rule) = queue.dequeue()
+
+      for(cell <- rule.triggeringCells(row, frame)){
+        triggers(cell.column)(cell.row).remove(SingleCell(column, row), frame)
+        if(!cellNeeded(cell)){
+          queue.enqueue( (
+            cell.column, 
+            cell.row, 
+            dag(cell.column)(cell.row).get
+          ) )
+        }
       }
     }
   }
@@ -142,55 +153,86 @@ class UpdateOverlay(
     // 2. One of the subscriptions depends on the specified row 
     //    (i.e., there is an existing trigger)
 
-    if(cellNeeded(column, row)){
-      for(cell <- rule.triggeringCells(row, frame)){
-        if(triggers(cell.column) contains cell.row){
-          triggers(cell.column)(cell.row).add(SingleCell(column, row), frame)
-        } else {
-          triggers(cell.column)(cell.row) = new TriggerSet(SingleCell(column, row), frame)
+    // Breadth-first search this business
+    val queue = mutable.Queue[(ColumnRef, RowIndex)]( column -> row )
 
-          // If this is the first reference to this cell, we may need to
-          // recursively add it to the list of active dependencies
-          dag(cell.column)(cell.row) match {
-            case None => ()
-            case Some(rule) => 
-              addTriggerFor(cell.column, cell.row, rule)
+    while( !queue.isEmpty )
+    {
+      val (column, row) = queue.dequeue()
+      if(cellNeeded(column, row)){
+        for(cell <- rule.triggeringCells(row, frame)){
+          if(triggers(cell.column) contains cell.row){
+            triggers(cell.column)(cell.row).add(SingleCell(column, row), frame)
+          } else {
+            triggers(cell.column)(cell.row) = new TriggerSet(SingleCell(column, row), frame)
+
+            // If this is the first reference to this cell, we may need to
+            // recursively add it to the list of active dependencies
+            dag(cell.column)(cell.row) match {
+              case None => ()
+              case Some(rule) => 
+                queue.enqueue( cell.column -> cell.row )
+            }
           }
         }
       }
-    }
 
+    }
   }
 
   def triggerReexecution(targets: Seq[SingleCell]): Unit = 
   {
     logger.debug(s"Starting re-execution pass with targets: $targets")
 
-    def collectUpstream(accum: Set[SingleCell], cell: SingleCell): Set[SingleCell] = 
+    def collectUpstream(initial: Set[SingleCell], cell: SingleCell): Set[SingleCell] = 
+    {
+      val accum = mutable.Set(initial.toSeq:_*)
+      val queue = mutable.Queue[SingleCell](cell)
       // simple memoization.  Don't recur to the cell if we've already visited it
-      if(accum contains cell){ accum }
-      else {
-        if((triggers(cell.column) contains cell.row) && 
-            !triggers(cell.column)(cell.row).isEmpty)
-        {
-          triggers(cell.column)(cell.row)
-            .iterator(frame)
-            .foldLeft(accum + cell) { collectUpstream(_, _) }
-        } else {
-          accum + cell
+
+      while( !queue.isEmpty )
+      {
+        val cell = queue.dequeue()
+  
+        if(accum contains cell){ /* do nothing */ }
+        else {
+          accum += cell
+          if((triggers(cell.column) contains cell.row) && 
+              !triggers(cell.column)(cell.row).isEmpty)
+          {
+            queue ++= 
+              triggers(cell.column)(cell.row)
+                .iterator(frame)
+          }
         }
       }
 
-    def collectDownstream(accum: Set[SingleCell], cell: SingleCell):Set[SingleCell] = 
-      if(accum contains cell){ accum }
-      else {
-        dag(cell.column)(cell.row) match {
-          case None => accum
-          case Some(rule) => 
-            rule.triggeringCells(cell.row, frame)
-                .foldLeft(accum + cell){ collectDownstream(_, _) }
+      accum.toSet
+    }
+
+    def collectDownstream(initial: Set[SingleCell], cell: SingleCell):Set[SingleCell] = 
+    {
+      val accum = mutable.Set(initial.toSeq:_*)
+      val queue = mutable.Queue[SingleCell](cell)
+
+      while( !queue.isEmpty )
+      {
+        val cell = queue.dequeue()
+
+        if(accum contains cell){ /* do nothing */ }
+        else {
+          dag(cell.column)(cell.row) match {
+            case None => /* do nothing */
+            case Some(rule) => 
+              accum += cell
+              queue ++= 
+                rule.triggeringCells(cell.row, frame)
+          }
         }
       }
+
+      accum.toSet
+    }
 
     val cellPromises =
       targets.foldLeft(Set[SingleCell]()) { (deps, cell) =>
